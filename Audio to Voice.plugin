@@ -1,0 +1,640 @@
+import json
+import os
+import time
+import traceback
+
+import requests
+
+from base_plugin import BasePlugin, MethodHook
+from client_utils import run_on_queue
+from android_utils import run_on_ui_thread, log
+from hook_utils import get_private_field
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+from java import jclass
+from java.lang import Integer
+from java.nio import ByteBuffer
+from java.util import ArrayList
+from org.telegram.messenger import ApplicationLoader, FileLoader, LocaleController, MessageObject, R
+from org.telegram.ui import ChatActivity
+
+__id__ = "audio_to_voice"
+__name__ = "Audio to Voice"
+__description__ = "Convert regular audio files into Telegram voice messages."
+__author__ = "@OpenAI"
+__min_version__ = "12.1.1"
+__icon__ = "msg_voiceshare"
+__version__ = "1.0.0"
+
+MENU_OPTION_ID = 843210
+MIN_CORE_VERSION = 4
+
+REPO_RAW = "https://github.com/kvuco/AudioToVoice/raw/main"
+VERSION_URL = f"{REPO_RAW}/actual.txt"
+DEFAULT_DEX_URL = f"{REPO_RAW}/audiotovoice.dex"
+MIN_DEX_BYTES = 8192
+
+JAVA_CLASS = "com.extera.plugins.audiotovoice.AudioToVoiceCore"
+METHOD_LOAD = "load"
+METHOD_UNLOAD = "unload"
+METHOD_GET_VERSION = "getVersion"
+METHOD_UPDATE_SETTINGS = "updateSettings"
+METHOD_OPEN_CONVERT_FLOW = "openConvertFlow"
+
+String = jclass("java.lang.String")
+
+
+def trace(message):
+    log(f"[{__id__}] {message}")
+
+
+def trace_exception(prefix, exc):
+    try:
+        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    except Exception:
+        details = str(exc)
+    trace(f"{prefix}: {details}")
+
+
+def describe_message(message_object):
+    if message_object is None:
+        return "message=null"
+    try:
+        message_id = message_object.getId()
+    except Exception:
+        message_id = None
+    try:
+        dialog_id = message_object.getDialogId()
+    except Exception:
+        dialog_id = None
+    file_name = None
+    try:
+        document = message_object.getDocument()
+        if document is not None:
+            file_name = str(FileLoader.getDocumentFileName(document) or "")
+    except Exception:
+        file_name = None
+    return f"message_id={message_id} dialog_id={dialog_id} file={file_name}"
+
+
+class Loader:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.dex_class = None
+        self.dex_loader = None
+        self.cache_dir = self._resolve_cache_dir()
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.dex_path = os.path.join(self.cache_dir, f"{__id__}.dex")
+        self._active = True
+        self._loaded = False
+        self._unloading = False
+        self._download_in_progress = False
+        self._update_in_progress = False
+
+    def _resolve_cache_dir(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            base = None
+            try:
+                if ctx is not None:
+                    base = ctx.getExternalFilesDir(None)
+            except Exception:
+                base = None
+            if base is None and ctx is not None:
+                try:
+                    base = ctx.getFilesDir()
+                except Exception:
+                    base = None
+            if base is not None:
+                return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
+        except Exception:
+            pass
+        return os.path.join(os.environ.get("HOME", os.getcwd()), "plugins_dex_cache")
+
+    def _ui(self, fn, delay=0):
+        if self._active:
+            run_on_ui_thread(fn, delay)
+
+    def _trace(self, message):
+        trace(f"loader: {message}")
+
+    def _request(self, url, timeout=10, retries=2):
+        last = None
+        for _ in range(retries + 1):
+            try:
+                return requests.get(url, timeout=timeout)
+            except Exception as e:
+                last = e
+                time.sleep(0.5)
+        raise last
+
+    def _write_atomic(self, path, data):
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+
+    def _reset_dex_state(self):
+        self.dex_class = None
+        self.dex_loader = None
+        self._loaded = False
+
+    def _urls_configured(self):
+        if not VERSION_URL or not DEFAULT_DEX_URL:
+            return False
+        return "USER/REPO" not in VERSION_URL and "USER/REPO" not in DEFAULT_DEX_URL
+
+    def _ensure_urls(self, show_error=True):
+        if self._urls_configured():
+            return True
+        if show_error:
+            self._ui(lambda: BulletinHelper.show_error("Set VERSION_URL/DEFAULT_DEX_URL before using the plugin"))
+        return False
+
+    def _load_dex_class(self, dex_bytes):
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            raise Exception("no_context")
+        self._trace(f"_load_dex_class bytes={len(dex_bytes)}")
+        try:
+            InMemoryDexClassLoader = jclass("dalvik.system.InMemoryDexClassLoader")
+            self.dex_loader = InMemoryDexClassLoader(ByteBuffer.wrap(dex_bytes), ctx.getClassLoader())
+            self.dex_class = self.dex_loader.loadClass(JAVA_CLASS)
+            self._trace("loaded class via InMemoryDexClassLoader")
+            return
+        except Exception:
+            self._trace("InMemoryDexClassLoader failed, trying DexClassLoader")
+            pass
+
+        DexClassLoader = jclass("dalvik.system.DexClassLoader")
+        code_cache = ctx.getCodeCacheDir() or ctx.getFilesDir()
+        out_dir = os.path.join(str(code_cache.getAbsolutePath()), "audio_to_voice_dex")
+        os.makedirs(out_dir, exist_ok=True)
+        dex_file = os.path.join(out_dir, f"{__id__}.dex")
+        with open(dex_file, "wb") as handle:
+            handle.write(dex_bytes)
+        self.dex_loader = DexClassLoader(dex_file, out_dir, None, ctx.getClassLoader())
+        self.dex_class = self.dex_loader.loadClass(JAVA_CLASS)
+        self._trace(f"loaded class via DexClassLoader path={dex_file}")
+
+    def _parse_version_file(self, text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("invalid_version")
+        try:
+            remote_ver = int(lines[0])
+        except Exception:
+            raise ValueError("invalid_version")
+        download_url = DEFAULT_DEX_URL
+        if len(lines) > 1 and lines[1].startswith("http"):
+            download_url = lines[1]
+        return remote_ver, download_url
+
+    def _fetch_remote_release(self):
+        response = self._request(VERSION_URL, timeout=10, retries=2)
+        if response.status_code != 200:
+            raise Exception(f"http_{response.status_code}")
+        return self._parse_version_file(response.text)
+
+    def dispose(self):
+        self._active = False
+
+    def load(self, show_error=False):
+        self._trace(f"load show_error={show_error} cache_exists={os.path.exists(self.dex_path)}")
+        if os.path.exists(self.dex_path):
+            try:
+                with open(self.dex_path, "rb") as handle:
+                    data = handle.read()
+                if not data or len(data) < MIN_DEX_BYTES:
+                    raise Exception("empty_cache")
+                self._trace(f"trying cached dex bytes={len(data)}")
+                if self.start_from_bytes(data):
+                    return
+                self._trace("cached dex failed to initialize")
+            except Exception as e:
+                self._trace(f"cache load failed: {e}")
+        if not self._ensure_urls(show_error=show_error):
+            return
+        self.download_and_load()
+
+    def download_and_load(self):
+        if not self._ensure_urls():
+            return
+        if self._download_in_progress:
+            self._ui(lambda: BulletinHelper.show_info("Download already in progress"))
+            return
+        self._trace("download_and_load scheduled")
+        self._download_in_progress = True
+        run_on_queue(self._download_worker)
+
+    def _download_worker(self):
+        try:
+            download_url = DEFAULT_DEX_URL
+            try:
+                _, download_url = self._fetch_remote_release()
+            except Exception as e:
+                self._trace(f"falling back to DEFAULT_DEX_URL: {e}")
+            self._trace(f"downloading dex from {download_url}")
+            response = self._request(download_url, timeout=20, retries=2)
+            if response.status_code != 200:
+                raise Exception(f"http_{response.status_code}")
+            data = response.content or b""
+            if not data or len(data) < MIN_DEX_BYTES:
+                raise Exception("empty_download")
+            self._write_atomic(self.dex_path, data)
+            self._trace(f"download complete bytes={len(data)}")
+            self._ui(lambda: self.start_from_bytes(data))
+        except Exception as e:
+            self._trace(f"download failed: {e}")
+            if isinstance(e, requests.RequestException):
+                self._ui(lambda: BulletinHelper.show_error("Network error"))
+            else:
+                self._ui(lambda: BulletinHelper.show_error(f"DEX download failed: {e}"))
+        finally:
+            self._download_in_progress = False
+
+    def start_from_bytes(self, dex_bytes):
+        try:
+            self._trace(f"start_from_bytes bytes={len(dex_bytes)}")
+            self._load_dex_class(dex_bytes)
+            load_method = self.dex_class.getDeclaredMethod(METHOD_LOAD)
+            load_method.setAccessible(True)
+            load_method.invoke(None)
+            self._loaded = True
+            self.sync_settings()
+            version = self.get_loaded_version()
+            self._trace(f"core loaded version={version}")
+            if version is None or version < MIN_CORE_VERSION:
+                raise Exception(f"outdated_core_{version}")
+            return True
+        except Exception as e:
+            self._reset_dex_state()
+            trace_exception("loader.start_from_bytes failed", e)
+            self._ui(lambda: BulletinHelper.show_error(f"DEX load error: {e}"))
+            return False
+
+    def sync_settings(self):
+        if not self.dex_class:
+            return
+        try:
+            payload = {"reply_in_source_chat": bool(self.plugin.get_setting("reply_in_source_chat", True))}
+            self._trace(f"sync_settings payload={payload}")
+            method = self.dex_class.getDeclaredMethod(METHOD_UPDATE_SETTINGS, String)
+            method.setAccessible(True)
+            method.invoke(None, json.dumps(payload))
+        except Exception as e:
+            trace_exception("loader.sync_settings failed", e)
+
+    def unload(self):
+        if self._unloading:
+            return
+        if not self._loaded and self.dex_class is None:
+            return
+        self._unloading = True
+        self._trace("unload started")
+        try:
+            if self.dex_class is not None:
+                method = self.dex_class.getDeclaredMethod(METHOD_UNLOAD)
+                method.setAccessible(True)
+                method.invoke(None)
+        except Exception as e:
+            trace_exception("loader.unload failed", e)
+        finally:
+            self.dex_class = None
+            self.dex_loader = None
+            self._loaded = False
+            self._unloading = False
+            self._trace("unload finished")
+
+    def check_for_updates(self):
+        if not self._ensure_urls():
+            return
+        if self._update_in_progress:
+            self._ui(lambda: BulletinHelper.show_info("Update check already running"))
+            return
+        self._update_in_progress = True
+        run_on_queue(self._update_worker)
+
+    def _update_worker(self):
+        try:
+            current_ver = self.get_loaded_version() or 0
+            remote_ver, download_url = self._fetch_remote_release()
+            if remote_ver <= current_ver:
+                self._ui(lambda: BulletinHelper.show_info("No updates found"))
+                return
+            self._ui(lambda: BulletinHelper.show_info("Downloading update..."))
+            response_dex = self._request(download_url, timeout=20, retries=2)
+            if response_dex.status_code != 200:
+                raise Exception(f"http_{response_dex.status_code}")
+            data = response_dex.content or b""
+            if not data or len(data) < MIN_DEX_BYTES:
+                raise Exception("empty_download")
+            self.unload()
+            self._write_atomic(self.dex_path, data)
+            def _start_updated_core():
+                if self.start_from_bytes(data):
+                    BulletinHelper.show_success("Updated")
+            self._ui(_start_updated_core)
+        except Exception as e:
+            trace_exception("loader._update_worker failed", e)
+            if isinstance(e, requests.RequestException):
+                self._ui(lambda: BulletinHelper.show_error("Network error"))
+            elif isinstance(e, ValueError):
+                self._ui(lambda: BulletinHelper.show_error("Invalid version file"))
+            else:
+                self._ui(lambda: BulletinHelper.show_error(f"Update failed: {e}"))
+        finally:
+            self._update_in_progress = False
+
+    def clear_cache(self):
+        if not os.path.exists(self.dex_path):
+            return False
+        try:
+            os.remove(self.dex_path)
+            return True
+        except Exception:
+            return False
+
+    def get_loaded_version(self):
+        if self.dex_class is None:
+            return None
+        try:
+            method = self.dex_class.getDeclaredMethod(METHOD_GET_VERSION)
+            method.setAccessible(True)
+            return int(method.invoke(None))
+        except Exception:
+            return None
+
+    def reload_core(self):
+        def _do():
+            try:
+                self.unload()
+            finally:
+                self.load(show_error=True)
+        run_on_queue(_do)
+
+    def open_convert_flow(self, chat_activity, message_object):
+        message_id = None
+        dialog_id = None
+        try:
+            if message_object is not None:
+                message_id = message_object.getId()
+                dialog_id = message_object.getDialogId()
+        except Exception:
+            pass
+        self._trace(f"open_convert_flow message_id={message_id} dialog_id={dialog_id} loaded={self._loaded}")
+        if self.dex_class is None or not self._loaded:
+            self.load(show_error=True)
+            if self.dex_class is None or not self._loaded:
+                if self._download_in_progress:
+                    BulletinHelper.show_info(self.plugin.get_string("core_downloading"))
+                else:
+                    BulletinHelper.show_error(self.plugin.get_string("core_not_loaded"))
+                return
+        try:
+            method = self.dex_class.getDeclaredMethod(METHOD_OPEN_CONVERT_FLOW, jclass("java.lang.Object"), jclass("java.lang.Object"))
+            method.setAccessible(True)
+            self._trace(f"invoking core openConvertFlow {describe_message(message_object)}")
+            method.invoke(None, chat_activity, message_object)
+        except Exception as e:
+            trace_exception("loader.open_convert_flow failed", e)
+            BulletinHelper.show_error(f"Failed to start conversion: {e}")
+
+
+class AudioToVoicePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.loader = None
+        self.strings = {}
+
+    def on_plugin_load(self):
+        trace("plugin load")
+        self.loader = Loader(self)
+        trace(f"cache_dir={self.loader.cache_dir}")
+        self.loader.load(show_error=False)
+        self.hook_method(
+            ChatActivity.getClass().getDeclaredMethod("fillMessageMenu", MessageObject, ArrayList, ArrayList, ArrayList),
+            self.FillMenuHook(self)
+        )
+        self.hook_method(
+            ChatActivity.getClass().getDeclaredMethod("processSelectedOption", Integer.TYPE),
+            self.ProcessOptionHook(self)
+        )
+        try:
+            if self.loader._urls_configured() and self.get_setting("auto_update", True) and self._can_check_updates():
+                self._record_update_check()
+                self.loader.check_for_updates()
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        trace("plugin unload")
+        if self.loader:
+            self.loader.unload()
+            self.loader.dispose()
+            self.loader = None
+
+    def get_string(self, key):
+        if not self.strings:
+            self._update_strings()
+        return self.strings.get(key, key)
+
+    def _update_strings(self):
+        try:
+            lang = LocaleController.getInstance().getCurrentLocaleInfo().getLangCode()
+        except Exception:
+            lang = "en"
+        is_ru = str(lang).startswith("ru")
+        self.strings = {
+            "settings_header": "Audio to Voice",
+            "menu_title": "Конвертировать в ГС" if is_ru else "Convert to voice message",
+            "auto_update": "Автообновление" if is_ru else "Auto update",
+            "auto_update_sub": "Проверять обновления при загрузке плагина" if is_ru else "Check updates on plugin load",
+            "check_updates": "Проверить обновления" if is_ru else "Check for updates",
+            "reload_core": "Перезагрузить ядро" if is_ru else "Reload core",
+            "show_version": "Показать версию ядра" if is_ru else "Show loaded version",
+            "clear_cache": "Очистить кэш и скачать заново" if is_ru else "Clear cache & redownload",
+            "reply_setting": "Ответом в исходный чат" if is_ru else "Reply in source chat",
+            "reply_setting_sub": "Отправлять как reply, если голосовое уходит обратно в исходный чат" if is_ru else "Send as a reply when the voice note goes back to the original chat",
+            "checking": "Проверка обновлений..." if is_ru else "Checking updates...",
+            "reloading": "Перезагрузка ядра..." if is_ru else "Reloading core...",
+            "cache_reload": "Кэш очищен. Скачиваю DEX..." if is_ru else "Cache cleared. Downloading DEX...",
+            "version_unknown": "Версия неизвестна" if is_ru else "Version unknown",
+            "version_label": "Версия" if is_ru else "Version",
+            "core_not_loaded": "Ядро не загружено" if is_ru else "Core is not loaded",
+            "core_downloading": "Ядро скачивается, попробуй снова через пару секунд" if is_ru else "Core is downloading, try again in a moment",
+            "unsupported_message": "Можно конвертировать только обычные аудиофайлы" if is_ru else "Only regular audio files can be converted",
+            "failed_open": "Не удалось запустить конвертацию" if is_ru else "Failed to open conversion flow",
+        }
+
+    def _is_supported_audio_message(self, message_object):
+        try:
+            if message_object is None:
+                return False
+            if message_object.isVoice() or message_object.isRoundVideo():
+                return False
+            if message_object.isMusic():
+                return True
+            document = message_object.getDocument()
+            if document is None:
+                return False
+            mime = str(getattr(document, "mime_type", "") or "").lower()
+            if mime.startswith("audio/"):
+                return True
+            filename = str(FileLoader.getDocumentFileName(document) or "").lower()
+            audio_exts = (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".oga", ".amr", ".wma")
+            return filename.endswith(audio_exts)
+        except Exception:
+            return False
+
+    def create_settings(self):
+        self._update_strings()
+        return [
+            Header(text=self.get_string("settings_header")),
+            Switch(
+                key="reply_in_source_chat",
+                text=self.get_string("reply_setting"),
+                subtext=self.get_string("reply_setting_sub"),
+                default=True,
+                icon="msg_select",
+                on_change=self.handle_reply_setting,
+            ),
+            Divider(),
+            Switch(
+                key="auto_update",
+                text=self.get_string("auto_update"),
+                subtext=self.get_string("auto_update_sub"),
+                default=True,
+                icon="msg_download_settings",
+                on_change=self.handle_auto_update,
+            ),
+            Text(
+                text=self.get_string("check_updates"),
+                icon="msg_download",
+                on_click=self.handle_check_updates,
+            ),
+            Text(
+                text=self.get_string("reload_core"),
+                icon="msg_reset",
+                on_click=self.handle_reload,
+            ),
+            Text(
+                text=self.get_string("show_version"),
+                icon="msg_info",
+                on_click=self.handle_show_version,
+            ),
+            Text(
+                text=self.get_string("clear_cache"),
+                icon="msg_delete",
+                red=True,
+                on_click=self.handle_clear_cache,
+            ),
+        ]
+
+    def _ensure_loader(self):
+        if not self.loader:
+            BulletinHelper.show_error(self.get_string("core_not_loaded"))
+            return False
+        return True
+
+    def _get_last_check(self):
+        try:
+            return int(self.get_setting("last_update_check", 0))
+        except Exception:
+            return 0
+
+    def _record_update_check(self):
+        try:
+            self.set_setting("last_update_check", int(time.time()))
+        except Exception:
+            pass
+
+    def _can_check_updates(self):
+        last = self._get_last_check()
+        if last <= 0:
+            return True
+        return (time.time() - last) >= 6 * 60 * 60
+
+    def handle_reply_setting(self, value):
+        if self.loader:
+            self.loader.sync_settings()
+
+    def handle_auto_update(self, enabled):
+        if not enabled or not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.get_string("checking"))
+        self._record_update_check()
+        self.loader.check_for_updates()
+
+    def handle_check_updates(self, *args):
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.get_string("checking"))
+        self._record_update_check()
+        self.loader.check_for_updates()
+
+    def handle_reload(self, *args):
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.get_string("reloading"))
+        self.loader.reload_core()
+
+    def handle_show_version(self, *args):
+        if not self._ensure_loader():
+            return
+        version = self.loader.get_loaded_version()
+        if version is None:
+            BulletinHelper.show_info(self.get_string("version_unknown"))
+        else:
+            BulletinHelper.show_info(f"{self.get_string('version_label')}: {version}")
+
+    def handle_clear_cache(self, *args):
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.get_string("cache_reload"))
+        self.loader.clear_cache()
+        self.loader.unload()
+        self.loader.download_and_load()
+
+    class FillMenuHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def after_hooked_method(self, param):
+            try:
+                message_object = param.args[0]
+                if not self.plugin._is_supported_audio_message(message_object):
+                    return
+                trace(f"menu add {describe_message(message_object)}")
+                param.args[2].add(self.plugin.get_string("menu_title"))
+                param.args[3].add(Integer(MENU_OPTION_ID))
+                param.args[1].add(Integer(R.drawable.msg_voiceshare))
+            except Exception as e:
+                trace_exception("FillMenuHook.after_hooked_method failed", e)
+
+    class ProcessOptionHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                if int(param.args[0]) != MENU_OPTION_ID:
+                    return
+                chat_activity = param.thisObject
+                selected = get_private_field(chat_activity, "selectedObject")
+                trace(f"menu click {describe_message(selected)}")
+                if not self.plugin._is_supported_audio_message(selected):
+                    BulletinHelper.show_error(self.plugin.get_string("unsupported_message"))
+                    param.setResult(None)
+                    return
+                if not self.plugin._ensure_loader():
+                    param.setResult(None)
+                    return
+                trace("dispatching open_convert_flow on UI thread")
+                run_on_ui_thread(lambda: self.plugin.loader.open_convert_flow(chat_activity, selected))
+                param.setResult(None)
+            except Exception as e:
+                trace_exception("ProcessOptionHook.before_hooked_method failed", e)
+                BulletinHelper.show_error(f"{self.plugin.get_string('failed_open')}: {e}")
+                param.setResult(None)
